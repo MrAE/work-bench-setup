@@ -1,0 +1,19 @@
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# PDF viewer cache
+.zotero-ft-cache/
+
+# BibTeX auxiliary files
+*.aux
+*.bbl
+*.blg
+*.bcf
+*.xml
+
+# Generated files
+*.pdf.bak
