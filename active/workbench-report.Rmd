@@ -1,0 +1,469 @@
+---
+title: "Workbench Update"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    keep_md: true
+    self_contained: true
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: false
+params:
+  wb_path: "."
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+# ── Packages ──────────────────────────────────────────────────────────────────
+required <- c("rdflib", "dplyr", "stringr", "lubridate",
+              "timevis", "DT", "knitr", "kableExtra", "htmltools")
+
+missing_pkgs <- required[!required %in% installed.packages()[, "Package"]]
+if (length(missing_pkgs) > 0) {
+  stop("Missing packages: ", paste(missing_pkgs, collapse = ", "))
+}
+
+suppressPackageStartupMessages({
+  library(rdflib)
+  library(dplyr)
+  library(stringr)
+  library(lubridate)
+  library(timevis)
+  library(DT)
+  library(knitr)
+  library(kableExtra)
+  library(htmltools)
+})
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+wb_path    <- normalizePath(params$wb_path, mustWork = TRUE)
+wb_name    <- basename(wb_path)
+ttl_path   <- file.path(wb_path, "workbench.ttl")
+tasks_path <- file.path(wb_path, "tasks.ttl")
+readme_path <- file.path(wb_path, "README.md")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+STATUS_LEVELS <- c("Active", "Blocked", "OnHold", "Planned", "Completed")
+
+STATUS_COLORS <- c(
+  Active    = "#27AE60",
+  Blocked   = "#E74C3C",
+  OnHold    = "#E67E22",
+  Planned   = "#2980B9",
+  Completed = "#95A5A6"
+)
+
+STATUS_PRIORITY <- c(Active = 1L, Blocked = 2L, OnHold = 3L,
+                     Planned = 4L, Completed = 5L)
+
+# ── SPARQL: workbench metadata ────────────────────────────────────────────────
+SPARQL_META <- "
+PREFIX dcterms: <http://purl.org/dc/terms/>
+PREFIX schema:  <https://schema.org/>
+PREFIX skos:    <http://www.w3.org/2004/02/skos/core#>
+
+SELECT ?title ?description ?created ?author
+WHERE {
+  ?wb a skos:ConceptScheme ;
+      dcterms:title ?title .
+  OPTIONAL { ?wb dcterms:description ?description }
+  OPTIONAL { ?wb dcterms:created     ?created     }
+  OPTIONAL { ?wb schema:author       ?author      }
+}
+LIMIT 1
+"
+
+# ── SPARQL: tasks ─────────────────────────────────────────────────────────────
+SPARQL_TASKS <- "
+PREFIX schema: <https://schema.org/>
+PREFIX rdfs:   <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX wbs:    <http://example.org/workbench/status#>
+
+SELECT DISTINCT ?name ?statusLabel ?startDate ?targetDate ?priority ?note
+WHERE {
+  ?task a schema:Action ;
+        schema:name         ?name ;
+        schema:actionStatus ?status .
+  ?status rdfs:label ?statusLabel .
+  OPTIONAL { ?task schema:startDate     ?startDate  }
+  OPTIONAL { ?task schema:scheduledTime ?targetDate }
+  OPTIONAL { ?task schema:priority      ?priority   }
+  OPTIONAL { ?task rdfs:comment         ?note       }
+}
+ORDER BY ?statusLabel ?name
+"
+
+# ── Load workbench metadata ───────────────────────────────────────────────────
+wb_meta <- list(
+  title       = str_remove(wb_name, "^wb-\\d{4}-\\d{2}-") |> str_replace_all("-", " ") |> str_to_title(),
+  description = "",
+  created     = "",
+  author      = ""
+)
+
+if (file.exists(ttl_path)) {
+  tryCatch({
+    rdf_obj   <- rdf_parse(ttl_path, format = "turtle")
+    meta_rows <- rdf_query(rdf_obj, SPARQL_META)
+    tryCatch(rdf_free(rdf_obj), error = function(e) NULL)
+
+    if (nrow(meta_rows) > 0) {
+      wb_meta$title       <- coalesce(meta_rows$title[1],       wb_meta$title)
+      wb_meta$description <- coalesce(meta_rows$description[1], "")
+      wb_meta$created     <- coalesce(meta_rows$created[1],     "")
+      wb_meta$author      <- coalesce(meta_rows$author[1],      "")
+    }
+  }, error = function(e) {
+    message("Could not parse workbench.ttl: ", conditionMessage(e))
+  })
+}
+
+# ── Load tasks ────────────────────────────────────────────────────────────────
+tasks_raw <- NULL
+
+if (file.exists(tasks_path)) {
+  tryCatch({
+    rdf_obj   <- rdf_parse(tasks_path, format = "turtle")
+    tasks_raw <- rdf_query(rdf_obj, SPARQL_TASKS)
+    tryCatch(rdf_free(rdf_obj), error = function(e) NULL)
+  }, error = function(e) {
+    message("Could not parse tasks.ttl: ", conditionMessage(e))
+  })
+}
+
+# ── Clean tasks ───────────────────────────────────────────────────────────────
+today <- Sys.Date()
+tasks <- NULL
+
+if (!is.null(tasks_raw) && nrow(tasks_raw) > 0) {
+  tasks <- tasks_raw |>
+    mutate(
+      status      = factor(statusLabel, levels = STATUS_LEVELS),
+      start_date  = if_else(!is.na(startDate),  ymd(startDate),  today),
+      open_ended  = is.na(targetDate),
+      target_date = if_else(!is.na(targetDate), ymd(targetDate), start_date + 30L),
+      status_rank = STATUS_PRIORITY[as.character(status)],
+      color       = STATUS_COLORS[as.character(status)]
+    ) |>
+    filter(!is.na(status)) |>
+    arrange(status_rank, start_date)
+}
+
+has_tasks <- !is.null(tasks) && nrow(tasks) > 0
+```
+
+```{css}
+/* ── Global ──────────────────────────────────────────────────────────────── */
+body { font-family: 'Source Sans Pro', 'Helvetica Neue', sans-serif; }
+
+/* ── Workbench header ────────────────────────────────────────────────────── */
+.wb-header {
+  background: linear-gradient(135deg, #2C3E50 0%, #3D5168 100%);
+  color: white;
+  padding: 28px 32px 22px;
+  border-radius: 6px;
+  margin-bottom: 28px;
+}
+.wb-header h1 {
+  margin: 0 0 6px 0;
+  font-size: 1.8em;
+  font-weight: 600;
+  color: white;
+  border: none;
+}
+.wb-header .wb-description {
+  font-size: 1.05em;
+  opacity: 0.85;
+  margin: 0 0 12px 0;
+}
+.wb-header .wb-meta {
+  font-size: 0.82em;
+  opacity: 0.65;
+  letter-spacing: 0.02em;
+}
+.wb-header .wb-meta span { margin-right: 18px; }
+
+/* ── Status badges ───────────────────────────────────────────────────────── */
+.badge-status {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 12px;
+  font-size: 0.78em;
+  font-weight: 600;
+  color: white;
+  letter-spacing: 0.03em;
+}
+.badge-Active    { background: #27AE60; }
+.badge-Blocked   { background: #E74C3C; }
+.badge-OnHold    { background: #E67E22; }
+.badge-Planned   { background: #2980B9; }
+.badge-Completed { background: #95A5A6; }
+
+/* ── Status summary table ────────────────────────────────────────────────── */
+.status-summary {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 18px 0 24px;
+}
+.status-card {
+  flex: 1 1 120px;
+  padding: 14px 18px;
+  border-radius: 6px;
+  color: white;
+  text-align: center;
+}
+.status-card .count  { font-size: 2em; font-weight: 700; line-height: 1; }
+.status-card .label  { font-size: 0.8em; opacity: 0.88; margin-top: 4px; }
+
+/* ── README section ──────────────────────────────────────────────────────── */
+.readme-content {
+  background: #FAFBFC;
+  border-left: 4px solid #3D5168;
+  padding: 20px 24px;
+  border-radius: 0 6px 6px 0;
+  margin-bottom: 24px;
+}
+.readme-content h2 { font-size: 1.15em; color: #2C3E50; margin-top: 20px; }
+.readme-content h2:first-child { margin-top: 0; }
+
+/* ── Section headers ─────────────────────────────────────────────────────── */
+h2 { color: #2C3E50; border-bottom: 2px solid #ECF0F1; padding-bottom: 6px; }
+h3 { color: #3D5168; }
+
+/* ── Timeline container ──────────────────────────────────────────────────── */
+.timeline-container { margin: 8px 0 24px; }
+
+/* ── Open-ended note ─────────────────────────────────────────────────────── */
+.note-open-ended {
+  font-size: 0.82em;
+  color: #7F8C8D;
+  font-style: italic;
+  margin-top: 6px;
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+.report-footer {
+  margin-top: 40px;
+  padding-top: 14px;
+  border-top: 1px solid #ECF0F1;
+  font-size: 0.8em;
+  color: #95A5A6;
+  text-align: center;
+}
+```
+
+```{r wb-header, results='asis'}
+# Workbench header block
+meta_parts <- character(0)
+if (nchar(wb_meta$created)  > 0) meta_parts <- c(meta_parts, paste0("Started: ", wb_meta$created))
+if (nchar(wb_meta$author)   > 0) meta_parts <- c(meta_parts, paste0("Author: ",  wb_meta$author))
+meta_parts <- c(meta_parts, paste0("Workbench: ", wb_name))
+
+cat(paste0('
+<div class="wb-header">
+  <h1>', wb_meta$title, '</h1>',
+  if (nchar(wb_meta$description) > 0)
+    paste0('<p class="wb-description">', wb_meta$description, '</p>')
+  else "",
+  '<div class="wb-meta">',
+  paste(paste0("<span>", meta_parts, "</span>"), collapse = ""),
+  '</div>
+</div>
+'))
+```
+
+---
+
+## Overview
+
+```{r readme, results='asis'}
+if (file.exists(readme_path)) {
+  readme_lines <- readLines(readme_path, warn = FALSE)
+
+  # Strip the first # heading (title already shown in header)
+  first_h1 <- which(str_detect(readme_lines, "^#\\s"))[1]
+  if (!is.na(first_h1)) readme_lines <- readme_lines[-first_h1]
+
+  cat('<div class="readme-content">\n\n')
+  cat(paste(readme_lines, collapse = "\n"))
+  cat('\n\n</div>\n')
+} else {
+  cat('*No README.md found in this workbench.*\n')
+}
+```
+
+---
+
+## Task Status
+
+```{r status-summary, results='asis'}
+if (has_tasks) {
+  status_counts <- tasks |>
+    count(statusLabel) |>
+    mutate(status = factor(statusLabel, levels = STATUS_LEVELS)) |>
+    arrange(status) |>
+    right_join(data.frame(statusLabel = STATUS_LEVELS), by = "statusLabel") |>
+    mutate(n = coalesce(n, 0L))
+
+  cards <- paste(
+    apply(status_counts, 1, function(row) {
+      label  <- row[["statusLabel"]]
+      count  <- row[["n"]]
+      color  <- STATUS_COLORS[[label]]
+      paste0(
+        '<div class="status-card" style="background:', color, '">',
+        '<div class="count">', count, '</div>',
+        '<div class="label">',  label, '</div>',
+        '</div>'
+      )
+    }),
+    collapse = "\n"
+  )
+
+  cat('<div class="status-summary">\n', cards, '\n</div>\n')
+
+  # Open-ended note
+  n_open <- sum(tasks$open_ended)
+  if (n_open > 0) {
+    cat(paste0(
+      '<p class="note-open-ended">⚠ ',
+      n_open, ' task', if (n_open > 1) "s" else "",
+      ' without a target date (shown as +30d estimate in timeline).</p>\n'
+    ))
+  }
+} else {
+  cat('*No tasks found in tasks.ttl.*\n')
+}
+```
+
+---
+
+## Timeline
+
+```{r timeline, results='asis'}
+if (!has_tasks) {
+  cat("*No tasks to display.*\n")
+} else {
+  cat('<div class="timeline-container">\n')
+}
+```
+
+```{r timevis, eval=has_tasks}
+tv_data <- tasks |>
+  mutate(row_id = row_number()) |>
+  transmute(
+    id      = row_id,
+    content = str_wrap(name, width = 30) |> str_replace_all("\n", "<br/>"),
+    start   = as.character(start_date),
+    end     = as.character(target_date),
+    title   = paste0(
+      "<div style='padding:8px;font-size:12px;min-width:200px'>",
+      "<b>", name, "</b><br/>",
+      "<span style='color:", STATUS_COLORS[statusLabel], "'>● </span>",
+      statusLabel,
+      if_else(!is.na(priority),
+              paste0("  ·  Priority: <b>", priority, "</b>"), ""),
+      if_else(open_ended,
+              "  ·  <i>no target date</i>", ""),
+      if_else(!is.na(note),
+              paste0("<br/><br/><i>", note, "</i>"), ""),
+      "</div>"
+    ),
+    style   = paste0(
+      "background-color:", STATUS_COLORS[statusLabel], ";",
+      "border-color:",     STATUS_COLORS[statusLabel], ";",
+      "color:white; border-radius:4px; font-size:11px;",
+      if_else(open_ended, "opacity:0.6; border-style:dashed;", "")
+    )
+  )
+
+timevis(
+  data    = tv_data,
+  options = list(
+    start           = as.character(today - 14L),
+    end             = as.character(today + 120L),
+    editable        = FALSE,
+    stack           = TRUE,
+    showMajorLabels = TRUE,
+    zoomMin         = 604800000L,   # 1 week
+    height          = "280px"
+  )
+)
+```
+
+```{r timeline-close, results='asis'}
+if (has_tasks) cat("</div>\n")
+```
+
+---
+
+## All Tasks
+
+```{r task-table, eval=has_tasks}
+dt_data <- tasks |>
+  transmute(
+    Task     = name,
+    Status   = statusLabel,
+    Priority = coalesce(priority, "—"),
+    Start    = as.character(start_date),
+    Target   = if_else(open_ended,
+                       paste0(as.character(target_date), " †"),
+                       as.character(target_date)),
+    Notes    = coalesce(note, "")
+  )
+
+# Build status color lookup for JS callback
+status_js_colors <- paste(
+  paste0('"', names(STATUS_COLORS), '":"', STATUS_COLORS, '"'),
+  collapse = ","
+)
+
+datatable(
+  dt_data,
+  rownames  = FALSE,
+  escape    = FALSE,
+  filter    = "top",
+  extensions = "Buttons",
+  options   = list(
+    pageLength = 25,
+    dom        = "Bfrtip",
+    buttons    = list("csv", "excel"),
+    order      = list(list(1L, "asc"), list(3L, "asc")),
+    columnDefs = list(
+      list(width = "35%", targets = 0L),
+      list(width = "10%", targets = c(1L, 2L, 3L, 4L)),
+      list(width = "25%", targets = 5L)
+    )
+  ),
+  callback = JS(paste0("
+    var colors = {", status_js_colors, "};
+    table.column(1).nodes().each(function(cell, i) {
+      var status = $(cell).text().trim();
+      if (colors[status]) {
+        $(cell).html(
+          '<span class=\"badge-status badge-' + status + '\">' + status + '</span>'
+        );
+      }
+    });
+  "))
+)
+```
+
+```{r no-tasks-msg, results='asis', eval=!has_tasks}
+cat("*No tasks found in tasks.ttl.*\n")
+```
+
+<div class="report-footer">
+  Generated by `workbench-report.Rmd` on `r format(Sys.time(), "%Y-%m-%d %H:%M")` &nbsp;·&nbsp;
+  Workbench: `r wb_name`
+</div>
+
+```{r, eval=TRUE, include=FALSE}
+save.image()
+```
